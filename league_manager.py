@@ -9,7 +9,7 @@ import numpy as np
 from pathlib import Path
 from openskill.models import PlackettLuce
 
-from .interfaces import LeagueAgent
+from interfaces import LeagueAgent
 
 
 class League:
@@ -29,20 +29,24 @@ class League:
         self.snapshots_dir = self.data_dir / "snapshots"
         self.matches_path = self.data_dir / "matches.csv"
 
-        # Ensure repo exists
-        if not (self.repo_path / ".git").exists():
-            raise ValueError(f"Not a git repository: {self.repo_path}")
+        # Check if repo is a git repository
+        self.is_git_repo = (self.repo_path / ".git").exists()
+        if not self.is_git_repo:
+            print(
+                f"League: WARNING - Not a git repository: {self.repo_path}. Sync disabled."
+            )
 
-        # Switch Branch
-        current_branch = self._get_current_branch()
-        if current_branch != branch:
-            print(f"League: Switching from {current_branch} to {branch}...")
-            if not self._checkout_branch(branch):
-                print(
-                    f"League: Failed to switch to branch {branch}. Staying on {current_branch}."
-                )
-        else:
-            print(f"League: On branch {branch}")
+        # Switch Branch (only if git repo)
+        if self.is_git_repo:
+            current_branch = self._get_current_branch()
+            if current_branch != branch:
+                print(f"League: Switching from {current_branch} to {branch}...")
+                if not self._checkout_branch(branch):
+                    print(
+                        f"League: Failed to switch to branch {branch}. Staying on {current_branch}."
+                    )
+            else:
+                print(f"League: On branch {branch}")
 
         # Ensure directories exist (in case branch was empty/new)
         self.registry_dir.mkdir(parents=True, exist_ok=True)
@@ -102,15 +106,36 @@ class League:
 
     def pull(self):
         """Pulls latest changes from remote."""
+        if not self.is_git_repo:
+            return True
+
         print("League: Pulling latest data...")
-        self._git_cmd(["pull", "--rebase"])
+        if self._git_cmd(["pull", "--rebase", "--autostash"]):
+            self.reload()
+            return True
+        return False
 
     def push(self, commit_message="Update league data"):
-        """Commits and pushes changes to remote."""
+        """Commits and pushes changes to remote with retry logic."""
+        if not self.is_git_repo:
+            print("League: Not a git repository, skipping push.")
+            return False
+
         print(f"League: Pushing changes ({commit_message})...")
         self._git_cmd(["add", "data/"])
-        if self._git_cmd(["commit", "-m", commit_message]):
-            self._git_cmd(["push"])
+        # Attempts to commit. If minimal changes, this might fail (empty commit) but we proceed.
+        self._git_cmd(["commit", "-m", commit_message])
+
+        # Retry loop for push (handle concurrent updates)
+        for i in range(3):
+            if self._git_cmd(["push"]):
+                return True
+            print(f"League: Push failed (attempt {i+1}/3). Pulling and retrying...")
+            if not self.pull():
+                time.sleep(1)  # Wait a bit before retry
+
+        print("League: Push failed after retries.")
+        return False
 
     def reload(self):
         """Reloads agents and recalculates ratings from match history."""

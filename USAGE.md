@@ -73,3 +73,24 @@ The "serverless" design means you must sync manually:
     git commit -m "Update match results"
     git push
     ```
+
+## 4. Branching & Experiments
+You can use Git branches to isolate experiments or parallel training runs.
+
+**How it works:**
+- Specify a branch name in your config (`league.branch`) or via CLI (`--league_branch`).
+- The League Manager will automatically checkout that branch.
+- If the branch doesn't exist, it will be **created automatically** from the current branch.
+- Validated agents and match results will be committed to that branch.
+
+**Example:**
+```bash
+# Start a new experiment on a separate branch
+python main.py --league_branch "experiment-alpha"
+```
+
+**Workflow:**
+1.  **Main League**: Keep the `main` branch for your best/stable agents.
+2.  **Experiments**: Use feature branches (e.g., `exp/larger-network`) for testing new ideas.
+3.  **Merging**: If an experiment yields a strong agent, you can merge the branch into `main` (standard Git merge) to introduce those agents to the general population.
+
