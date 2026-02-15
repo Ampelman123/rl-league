@@ -128,7 +128,7 @@ class League:
 
         # Retry loop for push (handle concurrent updates)
         for i in range(3):
-            if self._git_cmd(["push"]):
+            if self._git_cmd(["push", "-u", "origin", self.branch]):
                 return True
             print(f"League: Push failed (attempt {i+1}/3). Pulling and retrying...")
             if not self.pull():
@@ -184,11 +184,11 @@ class League:
                 # openskill expects ranks where lower is better (0=winner, 1=loser)
                 # If draw, ranks are equal
                 if s1 > s2:
-                    ranks = [[0], [1]]  # p1 wins
+                    ranks = [0, 1]  # p1 wins
                 elif s2 > s1:
-                    ranks = [[1], [0]]  # p2 wins
+                    ranks = [1, 0]  # p2 wins
                 else:
-                    ranks = [[0], [0]]  # draw
+                    ranks = [0, 0]  # draw
 
                 # Update
                 p1_rating = self.ratings[p1_id]
@@ -288,13 +288,14 @@ class League:
         r = self.ratings[agent_id]
         return r.mu, r.sigma
 
-    def matchmake(self, agent_id, strategy="pfsp"):
+    def matchmake(self, agent_id, strategy="pfsp", temperature=2.0):
         """
         Selects an opponent for the given agent.
 
         Args:
             agent_id: The ID of the agent looking for a match.
             strategy: 'pfsp' (Prioritized Fictitious Self-Play) or 'random'
+            temperature: Softmax temperature (lower = harder/strict, higher = softer/random).
 
         Returns:
             opponent_id (str), opponent_path (Path)
@@ -308,27 +309,26 @@ class League:
         if strategy == "random":
             opp_id = np.random.choice(candidates)
         else:
-            # PFSP-like: Pick someone with similar rating (maximize information gain / challenge)
+            # PFSP: Pick someone with similar rating using softmax
             my_mu, _ = self.get_rating(agent_id)
-
-            probs = []
+            rating_diffs = []
             valid_candidates = []
 
             for cid in candidates:
                 c_mu, _ = self.get_rating(cid)
-
-                # Simple heuristic: Probability proportional to 1 / (distance + epsilon)
-                # We want close ratings.
                 dist = abs(my_mu - c_mu)
-
-                # Avoid division by zero
-                prob = 1.0 / (dist + 0.1)
-
-                probs.append(prob)
+                rating_diffs.append(dist)
                 valid_candidates.append(cid)
 
-            # Normalize probabilities
-            probs = np.array(probs)
+            # Softmax: exp(-dist / temperature)
+            # Temperature heuristic: For mu~25, differences of 5-10 are significant.
+            # T=5.0 gives a softer distribution, T=1.0 is very sharp.
+            # temperature is now passed as an argument
+            logits = -np.array(rating_diffs) / temperature
+
+            # Stable softmax
+            logits -= np.max(logits)
+            probs = np.exp(logits)
             probs /= probs.sum()
 
             opp_id = np.random.choice(valid_candidates, p=probs)
