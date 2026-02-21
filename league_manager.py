@@ -3,7 +3,6 @@ import json
 import uuid
 import time
 import shutil
-import subprocess
 import pandas as pd
 import numpy as np
 from pathlib import Path
@@ -13,42 +12,27 @@ from interfaces import LeagueAgent
 
 
 class League:
-    def __init__(self, repo_path, branch="main", auto_sync=True):
+    def __init__(self, repo_path, branch=None, auto_sync=False):
         """
         Initialize the League manager.
 
         Args:
-            repo_path (str): Path to the root of the rl-league repository.
-            branch (str): Git branch to use for this league.
-            auto_sync (bool): If True, pulls from remote on initialization.
+            repo_path (str): Path to the root of the rl-league directory.
+            branch (str): The name/branch of the league. Data is scoped to this name.
+            auto_sync (bool): Ignored (kept for compatibility).
         """
         self.repo_path = Path(repo_path)
-        self.branch = branch
-        self.data_dir = self.repo_path / "data"
+
+        # Scope data by branch/name to avoid mixing different runs
+        if branch is None or branch == "":
+            branch = "default"
+
+        self.data_dir = self.repo_path / "data" / "leagues" / branch
         self.registry_dir = self.data_dir / "registry"
         self.snapshots_dir = self.data_dir / "snapshots"
         self.matches_path = self.data_dir / "matches.csv"
 
-        # Check if repo is a git repository
-        self.is_git_repo = (self.repo_path / ".git").exists()
-        if not self.is_git_repo:
-            print(
-                f"League: WARNING - Not a git repository: {self.repo_path}. Sync disabled."
-            )
-
-        # Switch Branch (only if git repo)
-        if self.is_git_repo:
-            current_branch = self._get_current_branch()
-            if current_branch != branch:
-                print(f"League: Switching from {current_branch} to {branch}...")
-                if not self._checkout_branch(branch):
-                    print(
-                        f"League: Failed to switch to branch {branch}. Staying on {current_branch}."
-                    )
-            else:
-                print(f"League: On branch {branch}")
-
-        # Ensure directories exist (in case branch was empty/new)
+        # Ensure directories exist
         self.registry_dir.mkdir(parents=True, exist_ok=True)
         self.snapshots_dir.mkdir(parents=True, exist_ok=True)
 
@@ -59,83 +43,7 @@ class League:
         self.agents = {}  # Map[agent_id] -> dict (metadata)
         self.ratings = {}  # Map[agent_id] -> openskill.Rating
 
-        if auto_sync:
-            self.pull()
-
         self.reload()
-
-    def _get_current_branch(self):
-        try:
-            res = subprocess.run(
-                ["git", "branch", "--show-current"],
-                cwd=self.repo_path,
-                capture_output=True,
-                text=True,
-                check=True,
-            )
-            return res.stdout.strip()
-        except:
-            return "unknown"
-
-    def _checkout_branch(self, branch):
-        # 1. Try checkout existing
-        if self._git_cmd(["checkout", branch]):
-            return True
-        # 2. Try checkout new local branch tracking origin
-        if self._git_cmd(["checkout", "-b", branch, f"origin/{branch}"]):
-            return True
-        # 3. Create new orphan/empty branch? Or just standard new branch from current?
-        # Standard: git checkout -b branch
-        print(f"League: Branch {branch} not found. Creating new branch.")
-        return self._git_cmd(["checkout", "-b", branch])
-
-    def _git_cmd(self, args):
-        """Helper to run git commands in the league repo."""
-        try:
-            subprocess.run(
-                ["git"] + args,
-                cwd=self.repo_path,
-                check=True,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-            )
-            return True
-        except subprocess.CalledProcessError as e:
-            print(f"Git command failed: {e.stderr.decode().strip()}")
-            return False
-
-    def pull(self):
-        """Pulls latest changes from remote."""
-        if not self.is_git_repo:
-            return True
-
-        print("League: Pulling latest data...")
-        if self._git_cmd(["pull", "--rebase", "--autostash"]):
-            self.reload()
-            return True
-        return False
-
-    def push(self, commit_message="Update league data"):
-        """Commits and pushes changes to remote with retry logic."""
-        if not self.is_git_repo:
-            print("League: Not a git repository, skipping push.")
-            return False
-
-        print(f"League: Pushing changes ({commit_message})...")
-        self._git_cmd(["add", "data/"])
-        # Attempts to commit. If minimal changes, this might fail (empty commit) but we proceed.
-        self._git_cmd(["commit", "-m", commit_message])
-
-        # Retry loop for push (handle concurrent updates)
-        for i in range(3):
-            if self._git_cmd(["push", "-u", "origin", self.branch]):
-                return True
-            print(f"League: Push failed (attempt {i+1}/3). Pulling and retrying...")
-            if not self.pull():
-                time.sleep(1)  # Wait a bit before retry
-
-        print("League: Push failed after retries.")
-        return False
 
     def reload(self):
         """Reloads agents and recalculates ratings from match history."""
@@ -204,31 +112,52 @@ class League:
         except Exception as e:
             print(f"Error recalculating ratings: {e}")
 
-    def add_agent(self, agent: LeagueAgent, owner: str, tags: list = None, sync=True):
+    def add_agent(
+        self,
+        agent: LeagueAgent,
+        owner: str,
+        tags: list = None,
+        sync=False,
+        agent_id=None,
+        is_fixed=False,
+    ):
         """
         Snapshot an agent and add it to the league.
 
         Args:
-            agent (LeagueAgent): The agent to save (must implement save()).
+            agent (LeagueAgent): The agent to save (must implement save()). Can be None if is_fixed=True.
             owner (str): Name of the user adding the agent.
             tags (list): Optional tags (e.g. 'gen10', 'production').
-            sync (bool): Whether to auto-push after adding.
+            sync (bool): Ignored (kept for compatibility).
+            agent_id (str): Optional explicit ID. If None, generated from timestamp.
+            is_fixed (bool): If True, does not save weights file (for benchmarks).
         """
         timestamp = int(time.time())
-        agent_id = f"{owner}_{timestamp}"
+        if agent_id is None:
+            agent_id = f"{owner}_{timestamp}"
 
-        # 1. Save Weights
-        save_path = self.snapshots_dir / f"{agent_id}.pt"
-
-        # Use the interface's save method
-        agent.save(str(save_path))
+        path_str = None
+        if not is_fixed:
+            # 1. Save Weights
+            save_path = self.snapshots_dir / f"{agent_id}.pt"
+            # Use the interface's save method
+            if agent:
+                agent.save(str(save_path))
+            # Store relative path for portability
+            try:
+                path_str = str(save_path.relative_to(self.repo_path))
+            except ValueError:
+                # Fallback if not relative (shouldn't happen with standard structure)
+                path_str = str(save_path)
+        else:
+            path_str = "FIXED"
 
         # 2. Save Metadata
         metadata = {
             "id": agent_id,
             "owner": owner,
             "timestamp": timestamp,
-            "path": str(save_path.relative_to(self.repo_path)),
+            "path": path_str,
             "tags": tags or [],
         }
 
@@ -239,17 +168,29 @@ class League:
         print(f"Added agent {agent_id} to league.")
         self.reload()
 
-        if sync:
-            self.push(f"Add agent {agent_id}")
-
         return agent_id
+
+    def ensure_benchmarks(self):
+        """Ensures 'weak' and 'strong' benchmark agents exist in the registry."""
+        benchmarks = ["weak", "strong"]
+        for b in benchmarks:
+            if b not in self.agents:
+                print(f"League: Registering missing benchmark '{b}'...")
+                self.add_agent(
+                    agent=None,
+                    owner="system",
+                    tags=["benchmark", b],
+                    agent_id=b,
+                    is_fixed=True,
+                    sync=False,
+                )
 
     def report_match(self, agent1_id, agent2_id, score1, score2, sync=False):
         """
         Reports a match result and appends it to history.
 
         Args:
-            sync (bool): If True, pushes the result to remote immediately.
+            sync (bool): Ignored (kept for compatibility).
         """
         # Ensure timestamp is unique/monotonically increasing if multiple writers (simple approximation)
         timestamp = int(time.time() * 1000)
@@ -266,18 +207,11 @@ class League:
         file_exists = self.matches_path.exists()
 
         # DataFrame is heavy for single row append, but handles CSV escaping well.
-        # For performance in high freq, manual string append is better.
-        # Here we use pandas for safety.
         df = pd.DataFrame([record])
         df.to_csv(self.matches_path, mode="a", header=not file_exists, index=False)
 
         # Update local ratings immediately (partial update)
-        # We could optimize by only updating the two agents involved,
-        # but for league size < 1000, full recalc is cheap (<100ms) and safer for consistency.
         self._recalculate_ratings()
-
-        if sync:
-            self.push(f"Match result: {agent1_id} vs {agent2_id}")
 
     def get_rating(self, agent_id):
         """Returns (mu, sigma) for a given agent."""
@@ -288,7 +222,9 @@ class League:
         r = self.ratings[agent_id]
         return r.mu, r.sigma
 
-    def matchmake(self, agent_id, strategy="pfsp", temperature=2.0):
+    def matchmake(
+        self, agent_id, strategy="pfsp", temperature=2.0, temperature_epsilon=0.2
+    ):
         """
         Selects an opponent for the given agent.
 
@@ -296,6 +232,7 @@ class League:
             agent_id: The ID of the agent looking for a match.
             strategy: 'pfsp' (Prioritized Fictitious Self-Play) or 'random'
             temperature: Softmax temperature (lower = harder/strict, higher = softer/random).
+            temperature_epsilon: Probability to choose purely random snapshot under PFSP.
 
         Returns:
             opponent_id (str), opponent_path (Path)
@@ -309,10 +246,15 @@ class League:
         if strategy == "random":
             opp_id = np.random.choice(candidates)
         else:
-            # PFSP: Pick someone with similar rating using softmax
-            my_mu, _ = self.get_rating(agent_id)
-            rating_diffs = []
-            valid_candidates = []
+            # Epsilon-Greedy PFSP: 20% of the time, force purely random selection
+            # to prevent catastrophic forgetting and ensure uniform history coverage
+            if strategy == "pfsp" and np.random.rand() < temperature_epsilon:
+                opp_id = np.random.choice(candidates)
+            else:
+                # PFSP: Pick someone with similar rating using softmax
+                my_mu, _ = self.get_rating(agent_id)
+                rating_diffs = []
+                valid_candidates = []
 
             for cid in candidates:
                 c_mu, _ = self.get_rating(cid)
@@ -321,9 +263,9 @@ class League:
                 valid_candidates.append(cid)
 
             # Softmax: exp(-dist / temperature)
-            # Temperature heuristic: For mu~25, differences of 5-10 are significant.
-            # T=5.0 gives a softer distribution, T=1.0 is very sharp.
-            # temperature is now passed as an argument
+            if not valid_candidates:
+                return None, None
+
             logits = -np.array(rating_diffs) / temperature
 
             # Stable softmax
