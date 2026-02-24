@@ -256,24 +256,24 @@ class League:
                 rating_diffs = []
                 valid_candidates = []
 
-            for cid in candidates:
-                c_mu, _ = self.get_rating(cid)
-                dist = abs(my_mu - c_mu)
-                rating_diffs.append(dist)
-                valid_candidates.append(cid)
+                for cid in candidates:
+                    c_mu, _ = self.get_rating(cid)
+                    dist = abs(my_mu - c_mu)
+                    rating_diffs.append(dist)
+                    valid_candidates.append(cid)
 
-            # Softmax: exp(-dist / temperature)
-            if not valid_candidates:
-                return None, None
+                # Softmax: exp(-dist / temperature)
+                if not valid_candidates:
+                    return None, None
 
-            logits = -np.array(rating_diffs) / temperature
+                logits = -np.array(rating_diffs) / temperature
 
-            # Stable softmax
-            logits -= np.max(logits)
-            probs = np.exp(logits)
-            probs /= probs.sum()
+                # Stable softmax
+                logits -= np.max(logits)
+                probs = np.exp(logits)
+                probs /= probs.sum()
 
-            opp_id = np.random.choice(valid_candidates, p=probs)
+                opp_id = np.random.choice(valid_candidates, p=probs)
 
         opp_data = self.agents[opp_id]
         # Return ID and absolute path to weights
